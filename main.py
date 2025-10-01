@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import gzip
 import tempfile
 import os
 from urllib.parse import urlparse, parse_qs
@@ -47,7 +48,7 @@ def fetch_unprocessed_domains(limit=1000):
             cur.execute("""
                 SELECT id, name_text
                 FROM domain
-                WHERE outbrain_status IS NULL and name_text = 'f1journaal.be'
+                WHERE outbrain_status IS NULL
                 ORDER BY id
                 LIMIT %s
             """, (limit,))
@@ -61,8 +62,8 @@ def update_domain_status(domain_id, status, partial_params=None, har_data=None):
     conn = get_db_connection()
     try:
         with conn.cursor() as cur:
-            # Convert har_data string to binary if present
-            har_binary = har_data.encode('utf-8') if har_data else None
+            # Compress har_data if present (gzip compression for legal evidence preservation)
+            har_binary = gzip.compress(har_data.encode('utf-8')) if har_data else None
 
             cur.execute("""
                 UPDATE domain

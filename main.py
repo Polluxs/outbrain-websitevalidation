@@ -216,9 +216,12 @@ async def main():
     # Load environment variables from .env file
     load_dotenv()
 
+    # Get batch limit from env (always require a number)
+    batch_limit = int(os.getenv('DOMAIN_LIMIT', '1000'))
+
     # Fetch unprocessed domains
     logger.info("Fetching unprocessed domains...")
-    domains = fetch_unprocessed_domains(limit=1000)
+    domains = fetch_unprocessed_domains(limit=batch_limit)
 
     if not domains:
         logger.info("No unprocessed domains found!")

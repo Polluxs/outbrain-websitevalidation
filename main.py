@@ -1,13 +1,13 @@
 import asyncio
 import gc
-import json
+import tempfile
+import os
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from camoufox.async_api import AsyncCamoufox
 from dotenv import load_dotenv
-import os
 from src.logging_config import logger
 
 # Expected parameters in Outbrain Multivac calls (from your research)
@@ -47,7 +47,7 @@ def fetch_unprocessed_domains(limit=1000):
             cur.execute("""
                 SELECT id, name_text
                 FROM domain
-                WHERE outbrain_status IS NULL
+                WHERE outbrain_status IS NULL and name_text = 'f1journaal.be'
                 ORDER BY id
                 LIMIT %s
             """, (limit,))
@@ -111,7 +111,7 @@ def analyze_outbrain_requests(outbrain_requests):
         return 'using_outbrain_partial_params', str(result)
 
 
-async def validate_domain(domain_name, page, cdp_session):
+async def validate_domain(domain_name, page):
     """Validate a single domain"""
     outbrain_requests = []
 
@@ -146,32 +146,14 @@ async def validate_domain(domain_name, page, cdp_session):
         if partial_params:
             logger.info(f"Partial params found: {partial_params[:100]}...")
 
-        # Get HAR data only if Outbrain is present
-        har_data = None
-        if status != 'not_using_outbrain':
-            try:
-                har = await cdp_session.send('Network.getHAR')
-                # Convert to JSON string exactly as browser would export it
-                har_json = json.dumps(har, indent=2)
-                har_size_mb = len(har_json.encode('utf-8')) / (1024 * 1024)
-
-                if har_size_mb > 10:
-                    logger.error(f"HAR file too large ({har_size_mb:.2f}MB) for {url}, skipping storage")
-                    har_data = None
-                else:
-                    har_data = har_json
-                    logger.info(f"HAR file captured ({har_size_mb:.2f}MB) for {url}")
-            except Exception as e:
-                logger.error(f"Failed to capture HAR for {url}: {str(e)}")
-
-        return status, partial_params, har_data
+        return status, partial_params
 
     except asyncio.TimeoutError:
         logger.warning(f"Timeout for {url} - marking as not_using_outbrain")
-        return 'not_using_outbrain', None, None
+        return 'not_using_outbrain', None
     except Exception as e:
         logger.error(f"Error validating {url}: {str(e)}")
-        return 'not_using_outbrain', None, None
+        return 'not_using_outbrain', None
 
 
 async def process_batch(domains, batch_size=10):
@@ -182,21 +164,49 @@ async def process_batch(domains, batch_size=10):
         batch = domains[i:i + batch_size]
         logger.info(f"Processing batch {i // batch_size + 1} ({i + 1}-{min(i + batch_size, total)} of {total})")
 
-        # Create browser for this batch
+        # Create browser once per batch
         async with AsyncCamoufox(headless=True) as browser:
-            page = await browser.new_page()
-
-            # Enable Network domain for HAR capture
-            cdp_session = await page.context.new_cdp_session(page)
-            await cdp_session.send('Network.enable')
-
             for domain in batch:
-                status, partial_params, har_data = await validate_domain(domain['name_text'], page, cdp_session)
-                update_domain_status(domain['id'], status, partial_params, har_data)
+                # Create a temporary HAR file for this domain
+                # Use /tmp on Railway (ephemeral but available), or custom dir if set
+                temp_dir = os.getenv('TEMP_DIR', '/tmp')
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.har', delete=False, dir=temp_dir) as har_file:
+                    har_path = har_file.name
 
-            await page.close()
+                try:
+                    # Create context with HAR recording enabled
+                    context = await browser.new_context(record_har_path=har_path)
+                    page = await context.new_page()
 
-        # Force garbage collection after browser closes
+                    status, partial_params = await validate_domain(domain['name_text'], page)
+
+                    await context.close()
+
+                    # Read HAR file if Outbrain is present
+                    har_data = None
+                    if status != 'not_using_outbrain' and os.path.exists(har_path):
+                        try:
+                            with open(har_path, 'r') as f:
+                                har_content = f.read()
+
+                            har_size_mb = len(har_content.encode('utf-8')) / (1024 * 1024)
+
+                            if har_size_mb > 10:
+                                logger.error(f"HAR file too large ({har_size_mb:.2f}MB) for {domain['name_text']}, skipping storage")
+                            else:
+                                har_data = har_content
+                                logger.info(f"HAR file captured ({har_size_mb:.2f}MB) for {domain['name_text']}")
+                        except Exception as e:
+                            logger.error(f"Failed to read HAR file for {domain['name_text']}: {str(e)}")
+
+                    update_domain_status(domain['id'], status, partial_params, har_data)
+
+                finally:
+                    # Clean up temporary HAR file
+                    if os.path.exists(har_path):
+                        os.remove(har_path)
+
+        # Force garbage collection after batch
         gc.collect()
         logger.info("Batch complete, browser cleaned up")
 

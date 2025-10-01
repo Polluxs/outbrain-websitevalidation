@@ -1,6 +1,7 @@
 import asyncio
 import gc
 import gzip
+import sys
 import tempfile
 import os
 from urllib.parse import urlparse, parse_qs
@@ -233,7 +234,12 @@ async def main():
     await process_batch(domains, batch_size=10)
 
     logger.info("Validation complete!")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
+        sys.exit(1)

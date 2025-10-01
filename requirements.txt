@@ -1,3 +1,5 @@
 playwright
 camoufox
 requests
+psycopg2-binary
+python-dotenv

@@ -135,8 +135,15 @@ async def validate_domain(domain_name, page):
         # Listen to network requests
         page.on('request', handle_request)
 
-        # Navigate with 30s timeout
-        await page.goto(url, wait_until="load", timeout=30000)
+        # Navigate with 30s timeout, wrapped in asyncio.wait_for for safety
+        try:
+            await asyncio.wait_for(
+                page.goto(url, wait_until="load", timeout=30000),
+                timeout=35.0  # Slightly longer than page timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"Navigation timeout for {url}")
+            return 'not_using_outbrain', None
 
         # Wait a bit for dynamic content to load
         await asyncio.sleep(2)
@@ -150,9 +157,6 @@ async def validate_domain(domain_name, page):
 
         return status, partial_params
 
-    except asyncio.TimeoutError:
-        logger.warning(f"Timeout for {url} - marking as not_using_outbrain")
-        return 'not_using_outbrain', None
     except Exception as e:
         logger.error(f"Error validating {url}: {str(e)}")
         return 'not_using_outbrain', None
@@ -183,6 +187,8 @@ async def process_batch(domains, batch_size=10):
 
                     status, partial_params = await validate_domain(domain['name_text'], page)
 
+                    logger.info(f"Validation complete for {domain['name_text']}, reading HAR...")
+
                     # Read HAR file if Outbrain is present
                     har_data = None
                     if status != 'not_using_outbrain' and os.path.exists(har_path):
@@ -200,7 +206,9 @@ async def process_batch(domains, batch_size=10):
                         except Exception as ex:
                             logger.error(f"Failed to read HAR file for {domain['name_text']}: {str(ex)}")
 
+                    logger.info(f"Updating database for {domain['name_text']}...")
                     update_domain_status(domain['id'], status, partial_params, har_data)
+                    logger.info(f"Database updated for {domain['name_text']}")
 
                 except Exception as ex:
                     logger.error(f"Critical error processing {domain['name_text']}: {str(ex)}")

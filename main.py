@@ -175,14 +175,13 @@ async def process_batch(domains, batch_size=10):
                 with tempfile.NamedTemporaryFile(mode='w', suffix='.har', delete=False, dir=temp_dir) as har_file:
                     har_path = har_file.name
 
+                context = None
                 try:
                     # Create context with HAR recording enabled
                     context = await browser.new_context(record_har_path=har_path)
                     page = await context.new_page()
 
                     status, partial_params = await validate_domain(domain['name_text'], page)
-
-                    await context.close()
 
                     # Read HAR file if Outbrain is present
                     har_data = None
@@ -198,12 +197,24 @@ async def process_batch(domains, batch_size=10):
                             else:
                                 har_data = har_content
                                 logger.info(f"HAR file captured ({har_size_mb:.2f}MB) for {domain['name_text']}")
-                        except Exception as e:
-                            logger.error(f"Failed to read HAR file for {domain['name_text']}: {str(e)}")
+                        except Exception as ex:
+                            logger.error(f"Failed to read HAR file for {domain['name_text']}: {str(ex)}")
 
                     update_domain_status(domain['id'], status, partial_params, har_data)
 
+                except Exception as ex:
+                    logger.error(f"Critical error processing {domain['name_text']}: {str(ex)}")
+                    update_domain_status(domain['id'], 'not_using_outbrain', None, None)
                 finally:
+                    # Force close context with timeout protection
+                    if context:
+                        try:
+                            await asyncio.wait_for(context.close(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            logger.warning(f"Context close timeout for {domain['name_text']}")
+                        except Exception as ex:
+                            logger.warning(f"Error closing context for {domain['name_text']}: {str(ex)}")
+
                     # Clean up temporary HAR file
                     if os.path.exists(har_path):
                         os.remove(har_path)

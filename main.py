@@ -214,18 +214,23 @@ async def process_batch(domains, batch_size=10):
                     logger.error(f"Critical error processing {domain['name_text']}: {str(ex)}")
                     update_domain_status(domain['id'], 'not_using_outbrain', None, None)
                 finally:
+                    logger.info(f"Cleaning up {domain['name_text']}...")
                     # Force close context with timeout protection
                     if context:
                         try:
+                            logger.info(f"Closing context for {domain['name_text']}...")
                             await asyncio.wait_for(context.close(), timeout=5.0)
+                            logger.info(f"Context closed for {domain['name_text']}")
                         except asyncio.TimeoutError:
                             logger.warning(f"Context close timeout for {domain['name_text']}")
                         except Exception as ex:
                             logger.warning(f"Error closing context for {domain['name_text']}: {str(ex)}")
 
                     # Clean up temporary HAR file
+                    logger.info(f"Removing HAR file for {domain['name_text']}...")
                     if os.path.exists(har_path):
                         os.remove(har_path)
+                    logger.info(f"Cleanup complete for {domain['name_text']}")
 
         # Force garbage collection after batch
         gc.collect()

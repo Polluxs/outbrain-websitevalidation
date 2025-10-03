@@ -170,9 +170,25 @@ async def process_batch(domains, batch_size=10):
         batch = domains[i:i + batch_size]
         logger.info(f"Processing batch {i // batch_size + 1} ({i + 1}-{min(i + batch_size, total)} of {total})")
 
+        # Clean up any leftover HAR files from previous crashes
+        temp_dir = os.getenv('TEMP_DIR', '/tmp')
+        try:
+            har_files = [f for f in os.listdir(temp_dir) if f.endswith('.har')]
+            if har_files:
+                logger.info(f"Cleaning up {len(har_files)} leftover HAR files...")
+                for har_file in har_files:
+                    try:
+                        os.remove(os.path.join(temp_dir, har_file))
+                    except Exception as ex:
+                        logger.warning(f"Could not remove {har_file}: {ex}")
+        except Exception as ex:
+            logger.warning(f"Could not clean temp directory: {ex}")
+
         # Create browser once per batch
         async with AsyncCamoufox(headless=True) as browser:
             for domain in batch:
+                logger.info(f"Starting processing for {domain['name_text']}...")
+
                 # Create a temporary HAR file for this domain
                 # Use /tmp on Railway (ephemeral but available), or custom dir if set
                 temp_dir = os.getenv('TEMP_DIR', '/tmp')

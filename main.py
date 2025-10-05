@@ -189,11 +189,9 @@ async def process_batch(domains, batch_size=10):
             for domain in batch:
                 logger.info(f"Starting processing for {domain['name_text']}...")
 
-                # Create a temporary HAR file for this domain
-                # Use /tmp on Railway (ephemeral but available), or custom dir if set
+                # Create HAR file path (don't use NamedTemporaryFile - it can hang)
                 temp_dir = os.getenv('TEMP_DIR', '/tmp')
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.har', delete=False, dir=temp_dir) as har_file:
-                    har_path = har_file.name
+                har_path = os.path.join(temp_dir, f"har_{domain['id']}.har")
 
                 context = None
                 try:

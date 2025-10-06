@@ -192,7 +192,7 @@ async def validate_domain(domain_name, page):
     try:
         # Listen to network requests
         page.on('request', handle_request)
-        page.goto(url, wait_until="load", timeout=30000)
+        await page.goto(url, wait_until="load", timeout=30000)
 
         # Wait a bit for dynamic content to load
         await asyncio.sleep(2)

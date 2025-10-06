@@ -9,6 +9,15 @@ class CustomRailwayLogFormatter(logging.Formatter):
             "level": record.levelname,
             "message": record.getMessage()
         }
+
+        # Add extra fields if present
+        for key, value in record.__dict__.items():
+            if key not in ['name', 'msg', 'args', 'created', 'filename', 'funcName', 'levelname',
+                          'levelno', 'lineno', 'module', 'msecs', 'message', 'pathname', 'process',
+                          'processName', 'relativeCreated', 'thread', 'threadName', 'exc_info',
+                          'exc_text', 'stack_info', 'taskName']:
+                log_record[key] = value
+
         return json.dumps(log_record)
 
 

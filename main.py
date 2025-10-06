@@ -2,8 +2,8 @@ import asyncio
 import gc
 import gzip
 import sys
-import tempfile
 import os
+from enum import Enum
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 import psycopg2
@@ -11,6 +11,13 @@ from psycopg2.extras import RealDictCursor
 from camoufox.async_api import AsyncCamoufox
 from dotenv import load_dotenv
 from src.logging_config import logger
+
+
+class OutbrainStatus(str, Enum):
+    """Outbrain validation status"""
+    NOT_USING = 'not_using_outbrain'
+    ALL_PARAMS = 'using_outbrain_all_params'
+    PARTIAL_PARAMS = 'using_outbrain_partial_params'
 
 # Expected parameters in Outbrain Multivac calls (from your research)
 EXPECTED_PARAMS = {
@@ -82,14 +89,14 @@ def update_domain_status(domain_id, status, partial_params=None, har_data=None):
 def analyze_outbrain_requests(outbrain_requests):
     """Analyze captured Outbrain requests for parameters"""
     if not outbrain_requests:
-        return 'not_using_outbrain', None
+        return OutbrainStatus.NOT_USING, None
 
     # Look for Multivac API calls
     multivac_calls = [r for r in outbrain_requests if 'mv.outbrain.com/Multivac/api/get' in r]
 
     if not multivac_calls:
         # Outbrain is present but no Multivac call - still using Outbrain
-        return 'using_outbrain_all_params', None
+        return OutbrainStatus.ALL_PARAMS, None
 
     # Parse parameters from first Multivac call
     parsed = urlparse(multivac_calls[0])
@@ -102,7 +109,7 @@ def analyze_outbrain_requests(outbrain_requests):
 
     if not missing_params:
         # All expected parameters found
-        return 'using_outbrain_all_params', None
+        return OutbrainStatus.ALL_PARAMS, None
     else:
         # Some parameters missing - this is weird
         result = {
@@ -110,7 +117,60 @@ def analyze_outbrain_requests(outbrain_requests):
             'missing': sorted(list(missing_params)),
             'extra': sorted(list(extra_params)) if extra_params else []
         }
-        return 'using_outbrain_partial_params', str(result)
+        return OutbrainStatus.PARTIAL_PARAMS, str(result)
+
+
+async def process_single_domain(browser, domain):
+    """Process a single domain with context creation, validation, and cleanup"""
+    domain_name = domain['name_text']
+    domain_id = domain['id']
+    temp_dir = os.getenv('TEMP_DIR', '/tmp')
+    har_path = os.path.join(temp_dir, f"har_{domain_id}.har")
+
+    context = None
+    try:
+        # Create context with HAR recording
+        context = await browser.new_context(record_har_path=har_path)
+        page = await context.new_page()
+
+        # Validate if it uses outbrain
+        status, partial_params = await validate_domain(domain_name, page)
+
+        # Read HAR file if Outbrain is present
+        har_data = None
+        if status != OutbrainStatus.NOT_USING and os.path.exists(har_path):
+            try:
+                with open(har_path, 'r') as f:
+                    har_content = f.read()
+
+                har_size_mb = len(har_content.encode('utf-8')) / (1024 * 1024)
+
+                if har_size_mb > 10:
+                    logger.error("HAR file too large, skipping storage", extra={"domain": domain_name, "har_size_mb": round(har_size_mb, 2)})
+                else:
+                    har_data = har_content
+                    logger.info("HAR file captured", extra={"domain": domain_name, "har_size_mb": round(har_size_mb, 2)})
+            except Exception as ex:
+                logger.error("Failed to read HAR file", extra={"domain": domain_name, "error": str(ex)})
+
+        # Update database
+        update_domain_status(domain_id, status, partial_params, har_data)
+        logger.info("Completed domain processing", extra={"domain": domain_name, "status": status})
+
+    finally:
+        # Cleanup context
+        if context:
+            try:
+                await asyncio.wait_for(context.close(), timeout=5.0)
+            except Exception as ex:
+                logger.warning("Failed to close context", extra={"domain": domain_name, "error": str(ex)})
+
+        # Cleanup HAR file
+        if os.path.exists(har_path):
+            try:
+                os.remove(har_path)
+            except Exception as ex:
+                logger.warning("Failed to remove HAR file", extra={"domain": domain_name, "error": str(ex)})
 
 
 async def validate_domain(domain_name, page):
@@ -129,37 +189,19 @@ async def validate_domain(domain_name, page):
     else:
         url = domain_name
 
-    logger.info(f"Checking domain: {url}")
-
     try:
         # Listen to network requests
         page.on('request', handle_request)
-
-        # Navigate with 30s timeout, wrapped in asyncio.wait_for for safety
-        try:
-            await asyncio.wait_for(
-                page.goto(url, wait_until="load", timeout=30000),
-                timeout=35.0  # Slightly longer than page timeout
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"Navigation timeout for {url}")
-            return 'not_using_outbrain', None
+        page.goto(url, wait_until="load", timeout=30000)
 
         # Wait a bit for dynamic content to load
         await asyncio.sleep(2)
 
-        # Analyze results
-        status, partial_params = analyze_outbrain_requests(outbrain_requests)
-
-        logger.info(f"Domain {url} - Status: {status}")
-        if partial_params:
-            logger.info(f"Partial params found: {partial_params[:100]}...")
-
-        return status, partial_params
+        return analyze_outbrain_requests(outbrain_requests)
 
     except Exception as e:
-        logger.error(f"Error validating {url}: {str(e)}")
-        return 'not_using_outbrain', None
+        logger.error("Domain validation failed", extra={"domain": domain_name, "url": url, "error": str(e)})
+        return OutbrainStatus.NOT_USING, None
 
 
 async def process_batch(domains, batch_size=10):
@@ -168,103 +210,58 @@ async def process_batch(domains, batch_size=10):
 
     for i in range(0, total, batch_size):
         batch = domains[i:i + batch_size]
-        logger.info(f"Processing batch {i // batch_size + 1} ({i + 1}-{min(i + batch_size, total)} of {total})")
+        batch_num = i // batch_size + 1
+        batch_start = i + 1
+        batch_end = min(i + batch_size, total)
+
+        logger.info("Processing batch", extra={
+            "batch_num": batch_num,
+            "batch_start": batch_start,
+            "batch_end": batch_end,
+            "total_domains": total
+        })
 
         # Clean up any leftover HAR files from previous crashes
         temp_dir = os.getenv('TEMP_DIR', '/tmp')
         try:
             har_files = [f for f in os.listdir(temp_dir) if f.endswith('.har')]
             if har_files:
-                logger.info(f"Cleaning up {len(har_files)} leftover HAR files...")
+                logger.info("Cleaning up leftover HAR files", extra={"har_file_count": len(har_files)})
                 for har_file in har_files:
                     try:
                         os.remove(os.path.join(temp_dir, har_file))
                     except Exception as ex:
-                        logger.warning(f"Could not remove {har_file}: {ex}")
+                        logger.warning("Could not remove HAR file", extra={"har_file": har_file, "error": str(ex)})
         except Exception as ex:
-            logger.warning(f"Could not clean temp directory: {ex}")
+            logger.warning("Could not clean temp directory", extra={"error": str(ex)})
 
         # Create browser once per batch
         async with AsyncCamoufox(headless=True) as browser:
             for domain in batch:
-                logger.info(f"[LINE 189] Starting processing for {domain['name_text']}...")
+                domain_name = domain['name_text']
 
-                # Create HAR file path (don't use NamedTemporaryFile - it can hang)
-                logger.info(f"[LINE 192] Getting temp_dir...")
-                temp_dir = os.getenv('TEMP_DIR', '/tmp')
-                logger.info(f"[LINE 194] Creating har_path for {domain['name_text']}...")
-                har_path = os.path.join(temp_dir, f"har_{domain['id']}.har")
-                logger.info(f"[LINE 196] HAR path created: {har_path}")
-
-                context = None
+                # Wrap entire domain processing in 60s timeout
                 try:
-                    # Create context with HAR recording enabled
-                    logger.info(f"[LINE 199] About to create browser context for {domain['name_text']}...")
-                    try:
-                        logger.info(f"[LINE 201] Calling browser.new_context()...")
-                        context = await asyncio.wait_for(
-                            browser.new_context(record_har_path=har_path),
-                            timeout=10.0
-                        )
-                        logger.info(f"[LINE 205] Context created for {domain['name_text']}")
-                    except asyncio.TimeoutError:
-                        logger.error(f"[LINE 207] Context creation timeout for {domain['name_text']}, skipping without marking...")
-                        continue
-
-                    logger.info(f"[LINE 210] Creating new page for {domain['name_text']}...")
-                    page = await context.new_page()
-                    logger.info(f"[LINE 212] Page created for {domain['name_text']}")
-
-                    status, partial_params = await validate_domain(domain['name_text'], page)
-
-                    logger.info(f"Validation complete for {domain['name_text']}, reading HAR...")
-
-                    # Read HAR file if Outbrain is present
-                    har_data = None
-                    if status != 'not_using_outbrain' and os.path.exists(har_path):
-                        try:
-                            with open(har_path, 'r') as f:
-                                har_content = f.read()
-
-                            har_size_mb = len(har_content.encode('utf-8')) / (1024 * 1024)
-
-                            if har_size_mb > 10:
-                                logger.error(f"HAR file too large ({har_size_mb:.2f}MB) for {domain['name_text']}, skipping storage")
-                            else:
-                                har_data = har_content
-                                logger.info(f"HAR file captured ({har_size_mb:.2f}MB) for {domain['name_text']}")
-                        except Exception as ex:
-                            logger.error(f"Failed to read HAR file for {domain['name_text']}: {str(ex)}")
-
-                    logger.info(f"Updating database for {domain['name_text']}...")
-                    update_domain_status(domain['id'], status, partial_params, har_data)
-                    logger.info(f"Database updated for {domain['name_text']}")
-
+                    await asyncio.wait_for(
+                        process_single_domain(browser, domain),
+                        timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.error("Domain processing timeout, will retry later", extra={
+                        "domain": domain_name,
+                        "timeout_seconds": 60,
+                        "batch_num": batch_num
+                    })
                 except Exception as ex:
-                    logger.error(f"Critical error processing {domain['name_text']}: {str(ex)}")
-                    update_domain_status(domain['id'], 'not_using_outbrain', None, None)
-                finally:
-                    logger.info(f"Cleaning up {domain['name_text']}...")
-                    # Force close context with timeout protection
-                    if context:
-                        try:
-                            logger.info(f"Closing context for {domain['name_text']}...")
-                            await asyncio.wait_for(context.close(), timeout=5.0)
-                            logger.info(f"Context closed for {domain['name_text']}")
-                        except asyncio.TimeoutError:
-                            logger.warning(f"Context close timeout for {domain['name_text']}")
-                        except Exception as ex:
-                            logger.warning(f"Error closing context for {domain['name_text']}: {str(ex)}")
-
-                    # Clean up temporary HAR file
-                    logger.info(f"Removing HAR file for {domain['name_text']}...")
-                    if os.path.exists(har_path):
-                        os.remove(har_path)
-                    logger.info(f"Cleanup complete for {domain['name_text']}")
+                    logger.error("Domain processing failed, will retry later", extra={
+                        "domain": domain_name,
+                        "error": str(ex),
+                        "batch_num": batch_num
+                    })
 
         # Force garbage collection after batch
         gc.collect()
-        logger.info("Batch complete, browser cleaned up")
+        logger.info("Batch complete", extra={"batch_num": batch_num})
 
 
 async def main():
@@ -275,25 +272,25 @@ async def main():
     batch_limit = int(os.getenv('DOMAIN_LIMIT', '1000'))
 
     # Fetch unprocessed domains
-    logger.info("Fetching unprocessed domains...")
+    logger.info("Fetching unprocessed domains", extra={"limit": batch_limit})
     domains = fetch_unprocessed_domains(limit=batch_limit)
 
     if not domains:
-        logger.info("No unprocessed domains found!")
+        logger.info("No unprocessed domains found")
         return
 
-    logger.info(f"Found {len(domains)} unprocessed domains")
+    logger.info("Found unprocessed domains", extra={"domain_count": len(domains)})
 
     # Process in batches of 10
     await process_batch(domains, batch_size=10)
 
-    logger.info("Validation complete!")
+    logger.info("Validation complete", extra={"total_processed": len(domains)})
     sys.exit(0)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except Exception as e:
-        logger.error(f"Fatal error: {str(e)}")
+    except Exception as ex:
+        logger.error("Fatal error", extra={"error": str(ex)})
         sys.exit(1)

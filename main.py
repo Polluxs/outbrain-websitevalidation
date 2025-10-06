@@ -259,6 +259,14 @@ async def process_batch(domains, batch_size=10):
                         "batch_num": batch_num
                     })
 
+        # Ensure the browser is closed
+        if browser:
+            try:
+                await browser.close()
+                logger.info("Browser closed successfully", extra={"batch_num": batch_num})
+            except Exception as ex:
+                logger.warning("Failed to close browser", extra={"batch_num": batch_num, "error": str(ex)})
+
         # Force garbage collection after batch
         gc.collect()
         logger.info("Batch complete", extra={"batch_num": batch_num})

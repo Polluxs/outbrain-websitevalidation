@@ -187,17 +187,33 @@ async def process_batch(domains, batch_size=10):
         # Create browser once per batch
         async with AsyncCamoufox(headless=True) as browser:
             for domain in batch:
-                logger.info(f"Starting processing for {domain['name_text']}...")
+                logger.info(f"[LINE 189] Starting processing for {domain['name_text']}...")
 
                 # Create HAR file path (don't use NamedTemporaryFile - it can hang)
+                logger.info(f"[LINE 192] Getting temp_dir...")
                 temp_dir = os.getenv('TEMP_DIR', '/tmp')
+                logger.info(f"[LINE 194] Creating har_path for {domain['name_text']}...")
                 har_path = os.path.join(temp_dir, f"har_{domain['id']}.har")
+                logger.info(f"[LINE 196] HAR path created: {har_path}")
 
                 context = None
                 try:
                     # Create context with HAR recording enabled
-                    context = await browser.new_context(record_har_path=har_path)
+                    logger.info(f"[LINE 199] About to create browser context for {domain['name_text']}...")
+                    try:
+                        logger.info(f"[LINE 201] Calling browser.new_context()...")
+                        context = await asyncio.wait_for(
+                            browser.new_context(record_har_path=har_path),
+                            timeout=10.0
+                        )
+                        logger.info(f"[LINE 205] Context created for {domain['name_text']}")
+                    except asyncio.TimeoutError:
+                        logger.error(f"[LINE 207] Context creation timeout for {domain['name_text']}, skipping without marking...")
+                        continue
+
+                    logger.info(f"[LINE 210] Creating new page for {domain['name_text']}...")
                     page = await context.new_page()
+                    logger.info(f"[LINE 212] Page created for {domain['name_text']}")
 
                     status, partial_params = await validate_domain(domain['name_text'], page)
 

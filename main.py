@@ -128,6 +128,7 @@ async def process_single_domain(browser, domain):
     har_path = os.path.join(temp_dir, f"har_{domain_id}.har")
 
     context = None
+    page = None
     try:
         # Create context with HAR recording
         context = await browser.new_context(record_har_path=har_path)
@@ -140,15 +141,14 @@ async def process_single_domain(browser, domain):
         har_data = None
         if status != OutbrainStatus.NOT_USING and os.path.exists(har_path):
             try:
-                with open(har_path, 'r') as f:
-                    har_content = f.read()
-
-                har_size_mb = len(har_content.encode('utf-8')) / (1024 * 1024)
+                # Check file size first before reading into memory
+                har_size_mb = os.path.getsize(har_path) / (1024 * 1024)
 
                 if har_size_mb > 10:
                     logger.error("HAR file too large, skipping storage", extra={"domain": domain_name, "har_size_mb": round(har_size_mb, 2)})
                 else:
-                    har_data = har_content
+                    with open(har_path, 'r') as f:
+                        har_data = f.read()
                     logger.info("HAR file captured", extra={"domain": domain_name, "har_size_mb": round(har_size_mb, 2)})
             except Exception as ex:
                 logger.error("Failed to read HAR file", extra={"domain": domain_name, "error": str(ex)})
@@ -158,10 +158,21 @@ async def process_single_domain(browser, domain):
         logger.info("Completed domain processing", extra={"domain": domain_name, "status": status})
 
     finally:
-        # Cleanup context
+        # Allow pending operations to complete before closing
+        if page:
+            try:
+                # Remove all event listeners first
+                page.remove_all_listeners()
+                # Give pending operations time to finish
+                await asyncio.sleep(0.1)
+                await page.close()
+            except Exception as ex:
+                logger.warning("Failed to close page", extra={"domain": domain_name, "error": str(ex)})
+
         if context:
             try:
-                await asyncio.wait_for(context.close(), timeout=5.0)
+                # Close context which flushes HAR recording
+                await context.close()
             except Exception as ex:
                 logger.warning("Failed to close context", extra={"domain": domain_name, "error": str(ex)})
 
@@ -197,10 +208,18 @@ async def validate_domain(domain_name, page):
         # Wait a bit for dynamic content to load
         await asyncio.sleep(2)
 
+        # Remove event listener to prevent accumulation
+        page.remove_listener('request', handle_request)
+
         return analyze_outbrain_requests(outbrain_requests)
 
     except Exception as e:
         logger.error("Domain validation failed", extra={"domain": domain_name, "url": url, "error": str(e)})
+        # Try to remove listener even on error
+        try:
+            page.remove_listener('request', handle_request)
+        except:
+            pass
         return OutbrainStatus.NOT_USING, None
 
 
@@ -235,7 +254,7 @@ async def process_batch(domains, batch_size=10):
         except Exception as ex:
             logger.warning("Could not clean temp directory", extra={"error": str(ex)})
 
-        # Create browser once per batch
+        # Create browser once per batch - async with handles cleanup
         async with AsyncCamoufox(headless=True) as browser:
             for domain in batch:
                 domain_name = domain['name_text']
@@ -259,13 +278,8 @@ async def process_batch(domains, batch_size=10):
                         "batch_num": batch_num
                     })
 
-        # Ensure the browser is closed
-        if browser:
-            try:
-                await browser.close()
-                logger.info("Browser closed successfully", extra={"batch_num": batch_num})
-            except Exception as ex:
-                logger.warning("Failed to close browser", extra={"batch_num": batch_num, "error": str(ex)})
+        # Browser is automatically closed by async with context manager
+        logger.info("Browser closed by context manager", extra={"batch_num": batch_num})
 
         # Force garbage collection after batch
         gc.collect()
